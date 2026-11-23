@@ -1,6 +1,8 @@
 /* Sopralluoghi – app offline per compilare la check-list ASPI e salvarla su Google Drive */
 "use strict";
-const VERSION = "1.0.1";
+const VERSION = "1.1.0";
+const CARTELLA_LAVORO = "FILE DI LAVORO";
+const GIORNI_AVVISO = 7;
 const CARTELLA_DRIVE = "VERBALE SOPRALLUOGHI ASPI";
 const CLIENT_ID_PREDEFINITO = "648194852883-b7rlulsqt3vbmg37r6p1bpbhaa744e2m.apps.googleusercontent.com";
 const XMIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -73,6 +75,35 @@ async function compress(file) {
   return { blob, w, h };
 }
 
+/* ---------- cartelle e file di lavoro su Drive ---------- */
+async function cartelle() {
+  if (!(await Drive.exists(S.settings.rootId))) { const r = await Drive.folder(CARTELLA_DRIVE, null, true); S.settings.rootId = r.id; S.settings.rootUrl = r.webViewLink; }
+  if (!(await Drive.exists(S.settings.lavoroId))) { const l = await Drive.folder(CARTELLA_LAVORO, S.settings.rootId); S.settings.lavoroId = l.id; S.settings.lavoroUrl = l.webViewLink; }
+  await saveSettings();
+}
+function tipoFile(nome) {
+  const n = nome.toUpperCase();
+  if (/ITP/.test(n)) return "loadItp";
+  if (/PROGRAMMA/.test(n)) return "loadProg";
+  if (/BAW/.test(n)) return "baw";
+  return null;
+}
+async function aggiornaDaDrive() {
+  const files = (await Drive.list(S.settings.lavoroId)).filter(f => /\.xls[xm]?$/i.test(f.name) || f.mimeType === "application/vnd.google-apps.spreadsheet");
+  const best = {};
+  files.forEach(f => { const t = tipoFile(f.name); if (t && (!best[t] || f.modifiedTime > best[t].modifiedTime)) best[t] = f; });
+  const fatto = [], note = [];
+  for (const [t, f] of Object.entries(best)) {
+    if (t === "baw") { note.push("scarico BAW trovato (integrazione in arrivo)"); continue; }
+    const cur = t === "loadItp" ? S.itp : S.prog;
+    if (cur && cur.src && cur.src.id === f.id && cur.src.mod === f.modifiedTime) continue;
+    try { fatto.push(await loadBuf(t, f.name, await Drive.download(f), { origine: "drive", id: f.id, mod: f.modifiedTime }, true)); }
+    catch (e) { note.push(`${f.name}: ${e.message}`); }
+  }
+  return { fatto, note, vuota: !Object.keys(best).length };
+}
+function etaFile(x) { if (!x) return null; const d = new Date((x.src && x.src.mod) || x.at); return Math.floor((Date.now() - d) / 86400000); }
+
 /* ---------- sincronizzazione Drive ---------- */
 async function sincronizza() {
   if (S.ui.busy) return;
@@ -82,7 +113,10 @@ async function sincronizza() {
   S.ui.busy = "Accesso a Google…"; renderBar();
   try {
     await Drive.auth(S.settings.clientId);
-    if (!(await Drive.exists(S.settings.rootId))) { const r = await Drive.folder(CARTELLA_DRIVE); S.settings.rootId = r.id; S.settings.rootUrl = r.webViewLink; await saveSettings(); }
+    await cartelle();
+    S.ui.busy = "Controllo i file di lavoro…"; renderBar();
+    let agg = { fatto: [], note: [] };
+    try { agg = await aggiornaDaDrive(); } catch (e) { agg.note.push("file di lavoro non letti: " + e.message); }
     let n = 0, err = 0;
     for (const x of list) {
       S.ui.busy = `Carico ${++n}/${list.length}…`; renderBar();
@@ -93,7 +127,10 @@ async function sincronizza() {
     const reg = new Blob([Core.xlsxRegistro(XLSX, S.verbali, S.itp && S.itp.operators)], { type: XMIME });
     const f = await Drive.upload("Registro_sopralluoghi.xlsx", XMIME, reg, S.settings.rootId, S.settings.registroId || null);
     S.settings.registroId = f.id; await saveSettings();
-    toast(err ? `${n - err} caricati, ${err} con errore: riprova.` : (n ? `${n} sopralluoghi caricati su Drive.` : "Tutto già su Drive. Registro aggiornato."));
+    const parti = [err ? `${n - err} caricati, ${err} con errore` : (n ? `${n} sopralluoghi caricati` : "sopralluoghi già su Drive")];
+    if (agg.fatto.length) parti.push("aggiornati: " + agg.fatto.join(", "));
+    if (agg.note.length) parti.push(agg.note.join("; "));
+    toast(parti.join(" · ") + ".");
   } catch (e) { toast(e.message); }
   finally { S.ui.busy = ""; render(); }
 }
@@ -146,6 +183,13 @@ async function hydrateThumbs() {
 }
 
 /* Elenco */
+function srcTxt(x) { const g = etaFile(x); const da = x.src && x.src.origine === "drive" ? "da Drive" : "dal telefono"; return `${da}, ${g === 0 ? "oggi" : g === 1 ? "ieri" : g + " giorni fa"}`; }
+function avvisoFile() {
+  const w = [];
+  if (S.itp && etaFile(S.itp) > GIORNI_AVVISO) w.push(`il file ITP è di ${etaFile(S.itp)} giorni fa`);
+  if (S.prog && S.prog.settimana && Core.diffDays(Core.today(), S.prog.settimana) > 6) w.push("il programma cantieri è della settimana scorsa");
+  return w.length ? `<section class="card lv-warn"><p><b>Attenzione:</b> ${w.join(" e ")}. Premi Sincronizza con la rete per prendere le versioni nuove da Drive.</p></section>` : "";
+}
 function vElenco() {
   const miss = [];
   if (!S.tpl) miss.push("Carica il <b>modello Word ASPI</b> preparato per l'app");
@@ -155,6 +199,7 @@ function vElenco() {
   return `
   ${miss.length ? `<section class="card lv-warn"><h3>Per iniziare</h3><ul class="setup">${miss.map(m => `<li>${m}</li>`).join("")}</ul><button class="btn" type="button" data-act="go" data-v="impostazioni">Apri Impostazioni</button></section>` : ""}
   ${installPrompt ? `<button class="btn wide" type="button" data-act="install">Installa l'app sul telefono</button>` : ""}
+  ${avvisoFile()}
   <div class="row"><button class="btn pri wide" type="button" data-act="newOpen">+ Nuovo sopralluogo</button></div>
   ${ns ? vNuovo() : ""}
   <h2>Sopralluoghi (${S.verbali.length})</h2>
@@ -217,6 +262,8 @@ function vCompila() {
   return `
   <div class="row between"><h2>${x.stato === "completato" ? "Sopralluogo completato" : "Sopralluogo in corso"}</h2><span class="muted">${done}/${Core.ITEMS.length} voci</span></div>
   <div class="prog" aria-hidden="true"><i style="width:${Math.round(done / Core.ITEMS.length * 100)}%"></i></div>
+  ${S.itp ? `<p class="muted">Verifiche sul file ITP ${esc(S.itp.name)} (${srcTxt(S.itp)})</p>` : ""}
+  ${avvisoFile()}
   <section class="card"><h3>Dati generali cantiere</h3>
     <div class="grid2">
       <label class="f" for="f-data">Data<input id="f-data" type="date" value="${esc(v.data)}" data-f="data"></label>
@@ -304,15 +351,16 @@ function vImpostazioni() {
   </section>
   <section class="card"><h3>File di lavoro (restano sul telefono)</h3>
     <div class="row between"><div><b>Modello Word ASPI</b><p class="muted">${S.tpl ? `${esc(S.tpl.name)} · ${esc(fmtTs(S.tpl.at))}` : "Non caricato"}</p></div><label class="btn sm file" for="tplIn">${S.tpl ? "Sostituisci" : "Carica"}<input id="tplIn" type="file" accept=".docx" data-act="loadTpl"></label></div>
-    <div class="row between"><div><b>Verifiche ITP (operatori e contratti)</b><p class="muted">${S.itp ? `${esc(S.itp.name)} · ${S.itp.operators.length} operatori · ${esc(fmtTs(S.itp.at))}` : "Non caricato"}</p></div><label class="btn sm file" for="itpIn">${S.itp ? "Aggiorna" : "Carica"}<input id="itpIn" type="file" accept=".xlsx,.xlsm" data-act="loadItp"></label></div>
-    <div class="row between"><div><b>Programma cantieri ASPI</b><p class="muted">${S.prog ? `${esc(S.prog.name)} · ${S.prog.cantieri.length} cantieri · settimana dal ${Core.fmtD(S.prog.settimana)}` : "Facoltativo: precompila dati e imprese"}</p></div><label class="btn sm file" for="progIn">${S.prog ? "Aggiorna" : "Carica"}<input id="progIn" type="file" accept=".xlsx,.xlsm" data-act="loadProg"></label></div>
+    <div class="row between"><div><b>Verifiche ITP (operatori e contratti)</b><p class="muted">${S.itp ? `${esc(S.itp.name)} · ${S.itp.operators.length} operatori · ${srcTxt(S.itp)}` : "Non caricato"}</p></div><label class="btn sm file" for="itpIn">${S.itp ? "Aggiorna" : "Carica"}<input id="itpIn" type="file" accept=".xlsx,.xlsm" data-act="loadItp"></label></div>
+    <div class="row between"><div><b>Programma cantieri ASPI</b><p class="muted">${S.prog ? `${esc(S.prog.name)} · ${S.prog.cantieri.length} cantieri · settimana dal ${Core.fmtD(S.prog.settimana)} · ${srcTxt(S.prog)}` : "Facoltativo: precompila dati e imprese"}</p></div><label class="btn sm file" for="progIn">${S.prog ? "Aggiorna" : "Carica"}<input id="progIn" type="file" accept=".xlsx,.xlsm" data-act="loadProg"></label></div>
     <div class="row between"><div><b>Scarico BAW</b><p class="muted">In arrivo: si collega appena ricevi il file.</p></div><button class="btn sm" type="button" disabled>Carica</button></div>
-    <p class="muted">Dal selettore file di Android puoi scegliere i file direttamente da Google Drive.</p>
+    <p class="muted">Aggiornamento automatico: metti i nuovi xlsx (nome con “ITP”, “PROGRAMMA” o “BAW”) nella cartella Drive “${esc(CARTELLA_DRIVE)}/${esc(CARTELLA_LAVORO)}”. A ogni Sincronizza l'app prende la versione più recente.</p>
+    <div class="row"><button class="btn" type="button" data-act="pullDrive">Aggiorna ora da Drive</button>${S.settings.lavoroUrl ? `<a class="btn" href="${esc(S.settings.lavoroUrl)}" target="_blank" rel="noopener">Apri ${esc(CARTELLA_LAVORO)}</a>` : ""}</div>
   </section>
   <section class="card"><h3>Google Drive</h3>
     <label class="f" for="s-cid">Client ID OAuth (Google Cloud)<input id="s-cid" value="${esc(st.clientId)}" data-s="clientId" placeholder="xxxxxxxx.apps.googleusercontent.com" autocapitalize="off" spellcheck="false"></label>
     <div class="row"><button class="btn pri" type="button" data-act="connect">Collega e verifica</button>${st.rootUrl ? `<a class="btn" href="${esc(st.rootUrl)}" target="_blank" rel="noopener">Apri cartella</a>` : ""}</div>
-    <p class="muted">I sopralluoghi vanno in “${esc(CARTELLA_DRIVE)}/anno-mese/nome verbale” con Word, Excel e foto, più il file Registro_sopralluoghi.xlsx. L'app accede solo ai file che crea lei.</p>
+    <p class="muted">I sopralluoghi vanno in “${esc(CARTELLA_DRIVE)}/anno-mese/nome verbale” con Word, Excel e foto, più il file Registro_sopralluoghi.xlsx. L'app scrive solo nelle cartelle che crea lei e legge il Drive per prendere i file di lavoro.</p>
   </section>
   <section class="card"><h3>Telefono</h3>
     <p class="muted" id="storeInfo">Memoria: calcolo in corso…</p>
@@ -353,8 +401,9 @@ async function concludi() {
   go("elenco");
   toast(navigator.onLine ? "Sopralluogo completato. Premi Sincronizza per caricarlo su Drive." : "Sopralluogo completato e salvato sul telefono. Lo carichi quando torna la rete.");
 }
-async function loadFile(kind, file) {
-  const buf = await file.arrayBuffer();
+async function loadFile(kind, file) { return loadBuf(kind, file.name, await file.arrayBuffer(), { origine: "telefono", mod: new Date().toISOString() }); }
+async function loadBuf(kind, name, buf, src, quiet) {
+  const file = { name };
   if (kind === "loadTpl") {
     const z = await JSZip.loadAsync(buf); const xml = await z.file("word/document.xml").async("string");
     if (!xml.includes("{{DATA}}") || !xml.includes("{{FOTO}}")) throw new Error("Questo Word non è il modello preparato per l'app: usa Modello_sopralluogo_ASPI_app.docx.");
@@ -362,13 +411,15 @@ async function loadFile(kind, file) {
     toast("Modello Word caricato.");
   } else if (kind === "loadItp") {
     const r = Core.parseITP(XLSX, buf);
-    S.itp = { name: file.name, at: new Date().toISOString(), foglio: r.foglio, operators: r.operators, imprese: r.imprese }; await DB.set("itp", S.itp);
-    fillDatalists(); toast(`File ITP caricato: ${r.operators.length} operatori.`);
+    S.itp = { name: file.name, at: new Date().toISOString(), src, foglio: r.foglio, operators: r.operators, imprese: r.imprese }; await DB.set("itp", S.itp);
+    fillDatalists(); if (!quiet) toast(`File ITP caricato: ${r.operators.length} operatori.`);
+    return `ITP ${r.operators.length} operatori`;
   } else if (kind === "loadProg") {
     const r = Core.parseProgramma(XLSX, buf);
     if (!r.cantieri.length) throw new Error("Nessun cantiere trovato: serve il programma settimanale (fogli per autostrada, dati dalla riga 5).");
-    S.prog = { name: file.name, at: new Date().toISOString(), settimana: r.settimana, cantieri: r.cantieri }; await DB.set("programma", S.prog);
-    fillDatalists(); toast(`Programma caricato: ${r.cantieri.length} cantieri.`);
+    S.prog = { name: file.name, at: new Date().toISOString(), src, settimana: r.settimana, cantieri: r.cantieri }; await DB.set("programma", S.prog);
+    fillDatalists(); if (!quiet) toast(`Programma caricato: ${r.cantieri.length} cantieri.`);
+    return `programma ${r.cantieri.length} cantieri`;
   }
 }
 function fillDatalists() {
@@ -411,7 +462,12 @@ document.addEventListener("click", async e => {
       case "delAsk": S.ui.delAsk = el.dataset.id; render(); break;
       case "delNo": S.ui.delAsk = null; render(); break;
       case "delDo": { const t = S.verbali.find(k => k.id === el.dataset.id); for (const f of t.foto) await DB.delFoto(f.id); await DB.remove(t.id); S.verbali = S.verbali.filter(k => k !== t); if (S.curId === t.id) { S.curId = null; await DB.set("curId", null); } S.ui.delAsk = null; render(); toast("Sopralluogo eliminato dal telefono (su Drive resta)."); break; }
-      case "connect": { await Drive.auth(S.settings.clientId); if (!(await Drive.exists(S.settings.rootId))) { const r = await Drive.folder(CARTELLA_DRIVE); S.settings.rootId = r.id; S.settings.rootUrl = r.webViewLink; } await saveSettings(); render(); toast("Google Drive collegato."); break; }
+      case "connect": case "pullDrive": {
+        if (!navigator.onLine) { toast("Serve la rete per collegarsi a Drive."); break; }
+        el.disabled = true; await Drive.auth(S.settings.clientId); await cartelle();
+        const r = await aggiornaDaDrive(); render();
+        toast(r.fatto.length ? "Aggiornati da Drive: " + r.fatto.join(", ") + "." : r.vuota ? `Drive collegato. Metti i file in “${CARTELLA_LAVORO}” per gli aggiornamenti automatici.` : "Drive collegato: i file di lavoro sono già aggiornati." + (r.note.length ? " " + r.note.join("; ") : ""));
+        break; }
       case "install": if (installPrompt) { installPrompt.prompt(); await installPrompt.userChoice; installPrompt = null; render(); } break;
     }
   } catch (err) { toast(err.message || String(err)); if (el) el.disabled = false; }
