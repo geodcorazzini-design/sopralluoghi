@@ -1,5 +1,5 @@
 /* Service worker: tiene l'app disponibile offline */
-const CACHE = "sopralluoghi-v1.1.0";
+const CACHE = "sopralluoghi-v1.1.1";
 const ASSETS = ["./", "./index.html", "./app.css", "./app.js", "./lib/core.js", "./lib/docx-fill.js", "./lib/drive.js",
   "./vendor/jszip.min.js", "./vendor/xlsx.full.min.js", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())); });

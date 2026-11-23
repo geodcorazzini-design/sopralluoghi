@@ -1,6 +1,6 @@
 /* Sopralluoghi – app offline per compilare la check-list ASPI e salvarla su Google Drive */
 "use strict";
-const VERSION = "1.1.0";
+const VERSION = "1.1.1";
 const CARTELLA_LAVORO = "FILE DI LAVORO";
 const GIORNI_AVVISO = 7;
 const CARTELLA_DRIVE = "VERBALE SOPRALLUOGHI ASPI";
